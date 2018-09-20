@@ -134,120 +134,447 @@ public class TicketPage extends RepositoryPage {
 			throw new RestartResponseException(TicketsPage.class, WicketUtils.newRepositoryParameter(repositoryName));
 		}
 
-		final List<Change> revisions = new ArrayList<Change>();
-		List<Change> comments = new ArrayList<Change>();
-		List<Change> statusChanges = new ArrayList<Change>();
-		List<Change> discussion = new ArrayList<Change>();
-		for (Change change : ticket.changes) {
-			if (change.hasComment() || (change.isStatusChange() && (change.getStatus() != Status.New))) {
-				discussion.add(change);
-			}
-			if (change.hasComment()) {
-				comments.add(change);
-			}
-			if (change.hasPatchset()) {
-				revisions.add(change);
-			}
-			if (change.isStatusChange() && !change.hasPatchset()) {
-				statusChanges.add(change);
-			}
-		}
-
-		final Change currentRevision = revisions.isEmpty() ? null : revisions.get(revisions.size() - 1);
+		final ChangesSummary changesSummary = new ChangesSummary(ticket.changes);
 		final Patchset currentPatchset = ticket.getCurrentPatchset();
+		setupTicketHeader(params, currentPatchset);
+		setupDiscussionsTab(params, user, repository, changesSummary, currentPatchset);
+		addCommentPanel(user, repository);
+		setupPatchSetTab(user, repository, changesSummary.currentRevision(), currentPatchset);
+		setupActivityTab(user, repository);
+	}
 
+	private void setupDiscussionsTab(PageParameters params, UserModel user, RepositoryModel repository, ChangesSummary changesSummary, Patchset currentPatchset) {
+		setupTabTitles(changesSummary.getComments(), currentPatchset);
+		setupTicketAuthorAndDateInDiscussionTab(params);
+		setupResponsibleInDiscussionTab();
+		setupMilestoneProgressInDiscussionTab(params, user, repository);
+		setupTopicAndLabelsInDisccussionTab(repository);
+		setupCommentsAndStatusChangesInDiscussionTab(changesSummary.getRevisions(), changesSummary.getComments(), changesSummary.getDiscussion());
+	}
+
+	private void setupActivityTab(UserModel user, RepositoryModel repository) {
 		/*
-		 * TICKET HEADER
+		 * ACTIVITY TAB
 		 */
-		String href = urlFor(TicketsPage.class, params).toString();
-		add(new ExternalLink("ticketNumber", href, "#" + ticket.number));
-		Label headerStatus = new Label("headerStatus", ticket.status.toString());
-		WicketUtils.setCssClass(headerStatus, TicketsUI.getLozengeClass(ticket.status, false));
-		add(headerStatus);
-		add(new Label("ticketTitle", ticket.title));
-		if (currentPatchset == null) {
-			add(new Label("diffstat").setVisible(false));
-		} else {
-			// calculate the current diffstat of the patchset
-			add(new DiffStatPanel("diffstat", ticket.insertions, ticket.deletions));
-		}
+		Fragment revisionHistory = new Fragment("activity", "activityFragment", this);
+		List<Change> events = new ArrayList<Change>(ticket.changes);
+		Collections.sort(events);
+		Collections.reverse(events);
+		ListDataProvider<Change> eventsDp = new ListDataProvider<Change>(events);
+		DataView<Change> eventsView = new DataView<Change>("event", eventsDp) {
+			private static final long serialVersionUID = 1L;
 
+			@Override
+			public void populateItem(final Item<Change> item) {
+				Change event = item.getModelObject();
 
-		/*
-		 * TAB TITLES
-		 */
-		add(new Label("commentCount", "" + comments.size()).setVisible(!comments.isEmpty()));
-		add(new Label("commitCount", "" + (currentPatchset == null ? 0 : currentPatchset.commits)).setVisible(currentPatchset != null));
+				addUserAttributions(item, event, 16);
 
+				if (event.hasPatchset()) {
+					// patchset
+					Patchset patchset = event.patchset;
+					String what;
+					if (event.isStatusChange() && (Status.New == event.getStatus())) {
+						what = getString("gb.proposedThisChange");
+					} else if (patchset.rev == 1) {
+						what = MessageFormat.format(getString("gb.uploadedPatchsetN"), patchset.number);
+					} else {
+						if (patchset.added == 1) {
+							what = getString("gb.addedOneCommit");
+						} else {
+							what = MessageFormat.format(getString("gb.addedNCommits"), patchset.added);
+						}
+					}
+					item.add(new Label("what", what));
 
-		/*
-		 * TICKET AUTHOR and DATE (DISCUSSION TAB)
-		 */
-		UserModel createdBy = app().users().getUserModel(ticket.createdBy);
-		if (createdBy == null) {
-			add(new Label("whoCreated", ticket.createdBy));
-		} else {
-			add(new LinkPanel("whoCreated", null, createdBy.getDisplayName(),
-					UserPage.class, WicketUtils.newUsernameParameter(createdBy.username)));
-		}
+					LinkPanel psr = new LinkPanel("patchsetRevision", null, patchset.number + "-" + patchset.rev,
+							ComparePage.class, WicketUtils.newRangeParameter(repositoryName, patchset.parent == null ? patchset.base : patchset.parent, patchset.tip), true);
+					WicketUtils.setHtmlTooltip(psr, patchset.toString());
+					WicketUtils.setCssClass(psr, "aui-lozenge aui-lozenge-subtle");
+					item.add(psr);
+					String typeCss = getPatchsetTypeCss(patchset.type);
+					Label typeLabel = new Label("patchsetType", patchset.type.toString());
+					if (typeCss == null) {
+						typeLabel.setVisible(false);
+					} else {
+						WicketUtils.setCssClass(typeLabel, typeCss);
+					}
+					item.add(typeLabel);
 
-		if (ticket.isProposal()) {
-			// clearly indicate this is a change ticket
-			add(new Label("creationMessage", getString("gb.proposedThisChange")));
-		} else {
-			// standard ticket
-			add(new Label("creationMessage", getString("gb.createdThisTicket")));
-		}
+					Link<Void> deleteLink = createDeletePatchsetLink(repository, patchset);
 
-		String dateFormat = app().settings().getString(Keys.web.datestampLongFormat, "EEEE, MMMM d, yyyy");
-		String timestampFormat = app().settings().getString(Keys.web.datetimestampLongFormat, "EEEE, MMMM d, yyyy");
-		final TimeZone timezone = getTimeZone();
-		final DateFormat df = new SimpleDateFormat(dateFormat);
-		df.setTimeZone(timezone);
-		final DateFormat tsf = new SimpleDateFormat(timestampFormat);
-		tsf.setTimeZone(timezone);
-		final Calendar cal = Calendar.getInstance(timezone);
+					if (user.canDeleteRef(repository)) {
+						item.add(deleteLink.setVisible(patchset.canDelete));
+					} else {
+						item.add(deleteLink.setVisible(false));
+					}
 
-		String fuzzydate;
-		TimeUtils tu = getTimeUtils();
-		Date createdDate = ticket.created;
-		if (TimeUtils.isToday(createdDate, timezone)) {
-			fuzzydate = tu.today();
-		} else if (TimeUtils.isYesterday(createdDate, timezone)) {
-			fuzzydate = tu.yesterday();
-		} else {
-			// calculate a fuzzy time ago date
-        	cal.setTime(createdDate);
-        	cal.set(Calendar.HOUR_OF_DAY, 0);
-        	cal.set(Calendar.MINUTE, 0);
-        	cal.set(Calendar.SECOND, 0);
-        	cal.set(Calendar.MILLISECOND, 0);
-        	createdDate = cal.getTime();
-			fuzzydate = getTimeUtils().timeAgo(createdDate);
-		}
-		Label when = new Label("whenCreated", fuzzydate + ", " + df.format(createdDate));
-		WicketUtils.setHtmlTooltip(when, tsf.format(ticket.created));
-		add(when);
+					// show commit diffstat
+					item.add(new DiffStatPanel("patchsetDiffStat", patchset.insertions, patchset.deletions, patchset.rev > 1));
+				} else if (event.hasComment()) {
+					// comment
+					item.add(new Label("what", getString("gb.commented")));
+					item.add(new Label("patchsetRevision").setVisible(false));
+					item.add(new Label("patchsetType").setVisible(false));
+					item.add(new Label("deleteRevision").setVisible(false));
+					item.add(new Label("patchsetDiffStat").setVisible(false));
+				} else if (event.hasReference()) {
+					// reference
+					switch (event.reference.getSourceType()) {
+						case Commit: {
+							final int shaLen = app().settings().getInteger(Keys.web.shortCommitIdLength, 6);
 
-		String exportHref = urlFor(ExportTicketPage.class, params).toString();
-		add(new ExternalLink("exportJson", exportHref, "json"));
+							item.add(new Label("what", getString("gb.referencedByCommit")));
+							LinkPanel psr = new LinkPanel("patchsetRevision", null, event.reference.toString().substring(0, shaLen),
+									CommitPage.class, WicketUtils.newObjectParameter(repositoryName, event.reference.toString()), true);
+							WicketUtils.setHtmlTooltip(psr, event.reference.toString());
+							WicketUtils.setCssClass(psr, "ticketReference-commit shortsha1");
+							item.add(psr);
 
+						} break;
 
-		/*
-		 * RESPONSIBLE (DISCUSSION TAB)
-		 */
-		if (StringUtils.isEmpty(ticket.responsible)) {
-			add(new Label("responsible"));
-		} else {
-			UserModel responsible = app().users().getUserModel(ticket.responsible);
-			if (responsible == null) {
-				add(new Label("responsible", ticket.responsible));
-			} else {
-				add(new LinkPanel("responsible", null, responsible.getDisplayName(),
-						UserPage.class, WicketUtils.newUsernameParameter(responsible.username)));
+						case Ticket: {
+							final String text = MessageFormat.format("ticket/{0}", event.reference.ticketId);
+
+							item.add(new Label("what", getString("gb.referencedByTicket")));
+							//NOTE: Ideally reference the exact comment using reference.toString,
+							//		however anchor hash is used and is escaped resulting in broken link
+							LinkPanel psr = new LinkPanel("patchsetRevision", null,  text,
+									TicketsPage.class, WicketUtils.newObjectParameter(repositoryName, event.reference.ticketId.toString()), true);
+							WicketUtils.setCssClass(psr, "ticketReference-comment");
+							item.add(psr);
+						} break;
+
+						default: {
+							item.add(new Label("what").setVisible(false));
+							item.add(new Label("patchsetRevision").setVisible(false));
+						}
+					}
+
+					item.add(new Label("patchsetType").setVisible(false));
+					item.add(new Label("deleteRevision").setVisible(false));
+					item.add(new Label("patchsetDiffStat").setVisible(false));
+				} else if (event.hasReview()) {
+					// review
+					String score;
+					switch (event.review.score) {
+					case approved:
+						score = "<span style='color:darkGreen'>" + getScoreDescription(event.review.score) + "</span>";
+						break;
+					case vetoed:
+						score = "<span style='color:darkRed'>" + getScoreDescription(event.review.score) + "</span>";
+						break;
+					default:
+						score = getScoreDescription(event.review.score);
+					}
+					item.add(new Label("what", MessageFormat.format(getString("gb.reviewedPatchsetRev"),
+							event.review.patchset, event.review.rev, score))
+							.setEscapeModelStrings(false));
+					item.add(new Label("patchsetRevision").setVisible(false));
+					item.add(new Label("patchsetType").setVisible(false));
+					item.add(new Label("deleteRevision").setVisible(false));
+					item.add(new Label("patchsetDiffStat").setVisible(false));
+				} else {
+					// field change
+					item.add(new Label("patchsetRevision").setVisible(false));
+					item.add(new Label("patchsetType").setVisible(false));
+					item.add(new Label("deleteRevision").setVisible(false));
+					item.add(new Label("patchsetDiffStat").setVisible(false));
+
+					String what = "";
+					if (event.isStatusChange()) {
+					switch (event.getStatus()) {
+					case New:
+						if (ticket.isProposal()) {
+							what = getString("gb.proposedThisChange");
+						} else {
+							what = getString("gb.createdThisTicket");
+						}
+						break;
+					default:
+						break;
+					}
+					}
+					item.add(new Label("what", what).setVisible(what.length() > 0));
+				}
+
+				addDateAttributions(item, event);
+
+				if (event.hasFieldChanges()) {
+					StringBuilder sb = new StringBuilder();
+					sb.append("<table class=\"summary\"><tbody>");
+					for (Map.Entry<Field, String> entry : event.fields.entrySet()) {
+						String value;
+						switch (entry.getKey()) {
+							case body:
+								String body = entry.getValue();
+								if (event.isStatusChange() && Status.New == event.getStatus() && StringUtils.isEmpty(body)) {
+									// ignore initial empty description
+									continue;
+								}
+								// trim body changes
+								if (StringUtils.isEmpty(body)) {
+									value = "<i>" + ESC_NIL + "</i>";
+								} else {
+									value = StringUtils.trimString(body, Constants.LEN_SHORTLOG_REFS);
+								}
+								break;
+							case status:
+								// special handling for status
+								Status status = event.getStatus();
+								String css = TicketsUI.getLozengeClass(status, true);
+								value = String.format("<span class=\"%1$s\">%2$s</span>", css, status.toString());
+								break;
+							default:
+								value = StringUtils.isEmpty(entry.getValue()) ? ("<i>" + ESC_NIL + "</i>") : StringUtils.escapeForHtml(entry.getValue(), false);
+								break;
+						}
+						sb.append("<tr><th style=\"width:70px;\">");
+						try {
+							sb.append(getString("gb." + entry.getKey().name()));
+						} catch (Exception e) {
+							sb.append(entry.getKey().name());
+						}
+						sb.append("</th><td>");
+						sb.append(value);
+						sb.append("</td></tr>");
+					}
+					sb.append("</tbody></table>");
+					String safeHtml = app().xssFilter().relaxed(sb.toString());
+					item.add(new Label("fields", safeHtml).setEscapeModelStrings(false));
+				} else {
+					item.add(new Label("fields").setVisible(false));
+				}
 			}
-		}
+		};
+		revisionHistory.add(eventsView);
+		add(revisionHistory);
+	}
 
+	private void setupPatchSetTab(UserModel user, RepositoryModel repository, Change currentRevision, Patchset currentPatchset) {
+		/*
+		 *  PATCHSET TAB
+		 */
+		if (currentPatchset == null) {
+			// no patchset available
+			RepositoryUrl repoUrl = getRepositoryUrl(user, repository);
+			boolean canPropose = repoUrl != null && repoUrl.hasPermission() && repoUrl.permission.atLeast(AccessPermission.CLONE) && !UserModel.ANONYMOUS.equals(user);
+			if (ticket.isOpen() && app().tickets().isAcceptingNewPatchsets(repository) && canPropose) {
+				// ticket & repo will accept a proposal patchset
+				// show the instructions for proposing a patchset
+				Fragment changeIdFrag = new Fragment("patchset", "proposeFragment", this);
+				changeIdFrag.add(new Label("proposeInstructions", MarkdownUtils.transformMarkdown(getString("gb.proposeInstructions"))).setEscapeModelStrings(false));
+				changeIdFrag.add(new Label("ptWorkflow", MessageFormat.format(getString("gb.proposeWith"), "Barnum")));
+				changeIdFrag.add(new Label("ptWorkflowSteps", getProposeWorkflow("propose_pt.md", repoUrl.url, ticket.number)).setEscapeModelStrings(false));
+				changeIdFrag.add(new Label("gitWorkflow", MessageFormat.format(getString("gb.proposeWith"), "Git")));
+				changeIdFrag.add(new Label("gitWorkflowSteps", getProposeWorkflow("propose_git.md", repoUrl.url, ticket.number)).setEscapeModelStrings(false));
+				add(changeIdFrag);
+			} else {
+				// explain why you can't propose a patchset
+				Fragment fragment = new Fragment("patchset", "canNotProposeFragment", this);
+				String reason = "";
+				if (ticket.isClosed()) {
+					reason = getString("gb.ticketIsClosed");
+				} else if (repository.isMirror) {
+					reason = getString("gb.repositoryIsMirror");
+				} else if (repository.isFrozen) {
+					reason = getString("gb.repositoryIsFrozen");
+				} else if (!repository.acceptNewPatchsets) {
+					reason = getString("gb.repositoryDoesNotAcceptPatchsets");
+				} else if (!canPropose) {
+					if (UserModel.ANONYMOUS.equals(user)) {
+						reason = getString("gb.anonymousCanNotPropose");
+					} else {
+						reason = getString("gb.youDoNotHaveClonePermission");
+					}
+				} else {
+					reason = getString("gb.serverDoesNotAcceptPatchsets");
+				}
+				fragment.add(new Label("reason", reason));
+				add(fragment);
+			}
+		} else {
+			// show current patchset
+			Fragment patchsetFrag = new Fragment("patchset", "patchsetFragment", this);
+			patchsetFrag.add(new Label("commitsInPatchset", MessageFormat.format(getString("gb.commitsInPatchsetN"), currentPatchset.number)));
+
+			patchsetFrag.add(createMergePanel(user, repository));
+
+			if (ticket.isOpen()) {
+				// current revision
+				MarkupContainer panel = createPatchsetPanel("panel", repository, user);
+				patchsetFrag.add(panel);
+				addUserAttributions(patchsetFrag, currentRevision, avatarWidth);
+				addUserAttributions(panel, currentRevision, 0);
+				addDateAttributions(panel, currentRevision);
+			} else {
+				// current revision
+				patchsetFrag.add(new Label("panel").setVisible(false));
+			}
+
+			// commits
+			List<RevCommit> commits = JGitUtils.getRevLog(getRepository(), currentPatchset.base, currentPatchset.tip);
+			ListDataProvider<RevCommit> commitsDp = new ListDataProvider<RevCommit>(commits);
+			DataView<RevCommit> commitsView = new DataView<RevCommit>("commit", commitsDp) {
+				private static final long serialVersionUID = 1L;
+
+				@Override
+				public void populateItem(final Item<RevCommit> item) {
+					RevCommit commit = item.getModelObject();
+					PersonIdent author = commit.getAuthorIdent();
+					item.add(new AvatarImage("authorAvatar", author.getName(), author.getEmailAddress(), null, 16, false));
+					item.add(new Label("author", commit.getAuthorIdent().getName()));
+					item.add(new LinkPanel("commitId", null, getShortObjectId(commit.getName()),
+							CommitPage.class, WicketUtils.newObjectParameter(repositoryName, commit.getName()), true));
+					item.add(new LinkPanel("diff", "link", getString("gb.diff"), CommitDiffPage.class,
+							WicketUtils.newObjectParameter(repositoryName, commit.getName()), true));
+					item.add(new Label("title", StringUtils.trimString(commit.getShortMessage(), Constants.LEN_SHORTLOG_REFS)));
+					item.add(WicketUtils.createDateLabel("commitDate", JGitUtils.getAuthorDate(commit), GitBlitWebSession
+							.get().getTimezone(), getTimeUtils(), false));
+					item.add(new DiffStatPanel("commitDiffStat", 0, 0, true));
+				}
+			};
+			patchsetFrag.add(commitsView);
+			add(patchsetFrag);
+		}
+	}
+
+	private void setupCommentsAndStatusChangesInDiscussionTab(List<Change> revisions, List<Change> comments, List<Change> discussion) {
+		/*
+		 * COMMENTS & STATUS CHANGES (DISCUSSION TAB)
+		 */
+		if (comments.size() == 0) {
+			add(new Label("discussion").setVisible(false));
+		} else {
+			Fragment discussionFragment = new Fragment("discussion", "discussionFragment", this);
+			ListDataProvider<Change> discussionDp = new ListDataProvider<Change>(discussion);
+			DataView<Change> discussionView = new DataView<Change>("discussion", discussionDp) {
+				private static final long serialVersionUID = 1L;
+
+				@Override
+				public void populateItem(final Item<Change> item) {
+					final Change entry = item.getModelObject();
+					if (entry.isMerge()) {
+						/*
+						 * MERGE
+						 */
+						String resolvedBy = entry.getString(Field.mergeSha);
+
+						// identify the merged patch, it is likely the last
+						Patchset mergedPatch = null;
+						for (Change c : revisions) {
+							if (c.patchset.tip.equals(resolvedBy)) {
+								mergedPatch = c.patchset;
+								break;
+							}
+						}
+
+						String commitLink;
+						if (mergedPatch == null) {
+							// shouldn't happen, but just-in-case
+							int len = app().settings().getInteger(Keys.web.shortCommitIdLength, 6);
+							commitLink = resolvedBy.substring(0, len);
+						} else {
+							// expected result
+							commitLink = mergedPatch.toString();
+						}
+
+						Fragment mergeFragment = new Fragment("entry", "mergeFragment", this);
+						mergeFragment.add(new LinkPanel("commitLink", null, commitLink,
+								CommitPage.class, WicketUtils.newObjectParameter(repositoryName, resolvedBy)));
+						mergeFragment.add(new Label("toBranch", MessageFormat.format(getString("gb.toBranch"),
+								"<b>" + ticket.mergeTo + "</b>")).setEscapeModelStrings(false));
+						addUserAttributions(mergeFragment, entry, 0);
+						addDateAttributions(mergeFragment, entry);
+
+						item.add(mergeFragment);
+					} else if (entry.isStatusChange()) {
+						/*
+						 *  STATUS CHANGE
+						 */
+						Fragment frag = new Fragment("entry", "statusFragment", this);
+						Label status = new Label("statusChange", entry.getStatus().toString());
+						String css = TicketsUI.getLozengeClass(entry.getStatus(), false);
+						WicketUtils.setCssClass(status, css);
+						frag.add(status);
+						addUserAttributions(frag, entry, avatarWidth);
+						addDateAttributions(frag, entry);
+						item.add(frag);
+					} else {
+						/*
+						 * COMMENT
+						 */
+						String bugtraq = bugtraqProcessor().processText(getRepository(), repositoryName, entry.comment.text);
+						String comment = MarkdownUtils.transformGFM(app().settings(), bugtraq, repositoryName);
+						String safeComment = app().xssFilter().relaxed(comment);
+						Fragment frag = new Fragment("entry", "commentFragment", this);
+						Label commentIcon = new Label("commentIcon");
+						if (entry.comment.src == CommentSource.Email) {
+							WicketUtils.setCssClass(commentIcon, "iconic-mail");
+						} else {
+							WicketUtils.setCssClass(commentIcon, "iconic-comment-alt2-stroke");
+						}
+						frag.add(commentIcon);
+						frag.add(new Label("comment", safeComment).setEscapeModelStrings(false));
+						addUserAttributions(frag, entry, avatarWidth);
+						addDateAttributions(frag, entry);
+						item.add(frag);
+					}
+				}
+			};
+			discussionFragment.add(discussionView);
+			add(discussionFragment);
+		}
+	}
+
+	private void addCommentPanel(UserModel user, RepositoryModel repository) {
+		/*
+		 * ADD COMMENT PANEL
+		 */
+		if (UserModel.ANONYMOUS.equals(user)
+				|| !repository.isBare
+				|| repository.isFrozen
+				|| repository.isMirror) {
+
+			// prohibit comments for anonymous users, local working copy repos,
+			// frozen repos, and mirrors
+			add(new Label("newComment").setVisible(false));
+		} else {
+			// permit user to comment
+			Fragment newComment = new Fragment("newComment", "newCommentFragment", this);
+			AvatarImage img = new AvatarImage("newCommentAvatar", user.username, user.emailAddress,
+					"gravatar-round", avatarWidth, true);
+			newComment.add(img);
+			CommentPanel commentPanel = new CommentPanel("commentPanel", user, ticket, null, TicketsPage.class);
+			commentPanel.setRepository(repositoryName);
+			newComment.add(commentPanel);
+			add(newComment);
+		}
+	}
+
+	private void setupTopicAndLabelsInDisccussionTab(RepositoryModel repository) {
+		/*
+		 * TOPIC & LABELS (DISCUSSION TAB->SIDE BAR)
+		 */
+		ListDataProvider<String> labelsDp = new ListDataProvider<String>(ticket.getLabels());
+		DataView<String> labelsView = new DataView<String>("labels", labelsDp) {
+			private static final long serialVersionUID = 1L;
+
+			@Override
+			public void populateItem(final Item<String> item) {
+				final String value = item.getModelObject();
+				Label label = new Label("label", value);
+				TicketLabel tLabel = app().tickets().getLabel(repository, value);
+				String background = MessageFormat.format("background-color:{0};", tLabel.color);
+				label.add(new SimpleAttributeModifier("style", background));
+				item.add(label);
+			}
+		};
+
+		add(labelsView);
+	}
+
+	private void setupMilestoneProgressInDiscussionTab(PageParameters params, UserModel user, RepositoryModel repository) {
 		/*
 		 * MILESTONE PROGRESS (DISCUSSION TAB)
 		 */
@@ -283,8 +610,107 @@ public class TicketPage extends RepositoryPage {
 			WicketUtils.setHtmlTooltip(milestoneProgress, MessageFormat.format(getString("gb.milestoneProgress"), open, closed));
 			add(milestoneProgress);
 		}
+		setupTicketDescriptionIInDiscussionTab();
+		setupParticipantsInDiscussionTab();
+		setupLargeStatusIndicatorWithIcon();
+		setupUpdateFormDiscussionTab(params, user, repository);
+		setupTicketMetadata();
+		setupVoters(user, repository);
+		setupWatchers(user, repository);
+	}
 
+	private void setupResponsibleInDiscussionTab() {
+		/*
+		 * RESPONSIBLE (DISCUSSION TAB)
+		 */
+		if (StringUtils.isEmpty(ticket.responsible)) {
+			add(new Label("responsible"));
+		} else {
+			UserModel responsible = app().users().getUserModel(ticket.responsible);
+			if (responsible == null) {
+				add(new Label("responsible", ticket.responsible));
+			} else {
+				add(new LinkPanel("responsible", null, responsible.getDisplayName(),
+						UserPage.class, WicketUtils.newUsernameParameter(responsible.username)));
+			}
+		}
+	}
 
+	private void setupTicketAuthorAndDateInDiscussionTab(PageParameters params) {
+		/*
+		 * TICKET AUTHOR and DATE (DISCUSSION TAB)
+		 */
+		UserModel createdBy = app().users().getUserModel(ticket.createdBy);
+		if (createdBy == null) {
+			add(new Label("whoCreated", ticket.createdBy));
+		} else {
+			add(new LinkPanel("whoCreated", null, createdBy.getDisplayName(),
+					UserPage.class, WicketUtils.newUsernameParameter(createdBy.username)));
+		}
+
+		if (ticket.isProposal()) {
+			// clearly indicate this is a change ticket
+			add(new Label("creationMessage", getString("gb.proposedThisChange")));
+		} else {
+			// standard ticket
+			add(new Label("creationMessage", getString("gb.createdThisTicket")));
+		}
+
+		String dateFormat = app().settings().getString(Keys.web.datestampLongFormat, "EEEE, MMMM d, yyyy");
+		String timestampFormat = app().settings().getString(Keys.web.datetimestampLongFormat, "EEEE, MMMM d, yyyy");
+		final TimeZone timezone = getTimeZone();
+		final DateFormat df = new SimpleDateFormat(dateFormat);
+		df.setTimeZone(timezone);
+		final DateFormat tsf = new SimpleDateFormat(timestampFormat);
+		tsf.setTimeZone(timezone);
+
+		String fuzzydate;
+		TimeUtils tu = getTimeUtils();
+		Date createdDate = ticket.created;
+		if (TimeUtils.isToday(createdDate, timezone)) {
+			fuzzydate = tu.today();
+		} else if (TimeUtils.isYesterday(createdDate, timezone)) {
+			fuzzydate = tu.yesterday();
+		} else {
+			// calculate a fuzzy time ago date
+			createdDate = getCreatedDate(timezone, createdDate);
+			fuzzydate = getTimeUtils().timeAgo(createdDate);
+		}
+		Label when = new Label("whenCreated", fuzzydate + ", " + df.format(createdDate));
+		WicketUtils.setHtmlTooltip(when, tsf.format(ticket.created));
+		add(when);
+
+		String exportHref = urlFor(ExportTicketPage.class, params).toString();
+		add(new ExternalLink("exportJson", exportHref, "json"));
+	}
+
+	private void setupTabTitles(List<Change> comments, Patchset currentPatchset) {
+		/*
+		 * TAB TITLES
+		 */
+		add(new Label("commentCount", "" + comments.size()).setVisible(!comments.isEmpty()));
+		add(new Label("commitCount", "" + (currentPatchset == null ? 0 : currentPatchset.commits)).setVisible(currentPatchset != null));
+	}
+
+	private void setupTicketHeader(PageParameters params, Patchset currentPatchset) {
+		/*
+		 * TICKET HEADER
+		 */
+		String href = urlFor(TicketsPage.class, params).toString();
+		add(new ExternalLink("ticketNumber", href, "#" + ticket.number));
+		Label headerStatus = new Label("headerStatus", ticket.status.toString());
+		WicketUtils.setCssClass(headerStatus, TicketsUI.getLozengeClass(ticket.status, false));
+		add(headerStatus);
+		add(new Label("ticketTitle", ticket.title));
+		if (currentPatchset == null) {
+			add(new Label("diffstat").setVisible(false));
+		} else {
+			// calculate the current diffstat of the patchset
+			add(new DiffStatPanel("diffstat", ticket.insertions, ticket.deletions));
+		}
+	}
+
+	private void setupTicketDescriptionIInDiscussionTab() {
 		/*
 		 * TICKET DESCRIPTION (DISCUSSION TAB)
 		 */
@@ -298,8 +724,9 @@ public class TicketPage extends RepositoryPage {
 			desc = safeHtml;
 		}
 		add(new Label("ticketDescription", desc).setEscapeModelStrings(false));
+	}
 
-
+	private void setupParticipantsInDiscussionTab() {
 		/*
 		 * PARTICIPANTS (DISCUSSION TAB)
 		 */
@@ -329,8 +756,9 @@ public class TicketPage extends RepositoryPage {
 			add(new Label("participantsLabel").setVisible(false));
 			add(new Label("participants").setVisible(false));
 		}
+	}
 
-
+	private void setupLargeStatusIndicatorWithIcon() {
 		/*
 		 * LARGE STATUS INDICATOR WITH ICON (DISCUSSION TAB->SIDE BAR)
 		 */
@@ -340,8 +768,9 @@ public class TicketPage extends RepositoryPage {
 		ticketStatus.add(new Label("ticketStatus", ticket.status.toString()));
 		WicketUtils.setCssClass(ticketStatus, TicketsUI.getLozengeClass(ticket.status, false));
 		add(ticketStatus);
+	}
 
-
+	private void setupUpdateFormDiscussionTab(PageParameters params, UserModel user, RepositoryModel repository) {
 		/*
 		 * UPDATE FORM (DISCUSSION TAB)
 		 */
@@ -357,11 +786,11 @@ public class TicketPage extends RepositoryPage {
 				 */
 				List<Status> choices = new ArrayList<Status>();
 				if (ticket.isProposal()) {
-					choices.addAll(Arrays.asList(TicketModel.Status.proposalWorkflow));
+					choices.addAll(Arrays.asList(Status.proposalWorkflow));
 				} else if (ticket.isBug()) {
-					choices.addAll(Arrays.asList(TicketModel.Status.bugWorkflow));
+					choices.addAll(Arrays.asList(Status.bugWorkflow));
 				} else {
-					choices.addAll(Arrays.asList(TicketModel.Status.requestWorkflow));
+					choices.addAll(Arrays.asList(Status.requestWorkflow));
 				}
 				choices.remove(ticket.status);
 
@@ -520,8 +949,9 @@ public class TicketPage extends RepositoryPage {
 		} else {
 			add(new Label("controls").setVisible(false));
 		}
+	}
 
-
+	private void setupTicketMetadata() {
 		/*
 		 * TICKET METADATA
 		 */
@@ -538,10 +968,9 @@ public class TicketPage extends RepositoryPage {
 			String safeTopic = app().xssFilter().relaxed(topic);
 			add(new Label("ticketTopic", safeTopic).setEscapeModelStrings(false));
 		}
+	}
 
-
-
-
+	private void setupVoters(UserModel user, RepositoryModel repository) {
 		/*
 		 * VOTERS
 		 */
@@ -580,8 +1009,9 @@ public class TicketPage extends RepositoryPage {
 		} else {
 			add(new Label("voteLink").setVisible(false));
 		}
+	}
 
-
+	private void setupWatchers(UserModel user, RepositoryModel repository) {
 		/*
 		 * WATCHERS
 		 */
@@ -620,422 +1050,16 @@ public class TicketPage extends RepositoryPage {
 		} else {
 			add(new Label("watchLink").setVisible(false));
 		}
+	}
 
-
-		/*
-		 * TOPIC & LABELS (DISCUSSION TAB->SIDE BAR)
-		 */
-		ListDataProvider<String> labelsDp = new ListDataProvider<String>(ticket.getLabels());
-		DataView<String> labelsView = new DataView<String>("labels", labelsDp) {
-			private static final long serialVersionUID = 1L;
-
-			@Override
-			public void populateItem(final Item<String> item) {
-				final String value = item.getModelObject();
-				Label label = new Label("label", value);
-				TicketLabel tLabel = app().tickets().getLabel(repository, value);
-				String background = MessageFormat.format("background-color:{0};", tLabel.color);
-				label.add(new SimpleAttributeModifier("style", background));
-				item.add(label);
-			}
-		};
-
-		add(labelsView);
-
-
-		/*
-		 * COMMENTS & STATUS CHANGES (DISCUSSION TAB)
-		 */
-		if (comments.size() == 0) {
-			add(new Label("discussion").setVisible(false));
-		} else {
-			Fragment discussionFragment = new Fragment("discussion", "discussionFragment", this);
-			ListDataProvider<Change> discussionDp = new ListDataProvider<Change>(discussion);
-			DataView<Change> discussionView = new DataView<Change>("discussion", discussionDp) {
-				private static final long serialVersionUID = 1L;
-
-				@Override
-				public void populateItem(final Item<Change> item) {
-					final Change entry = item.getModelObject();
-					if (entry.isMerge()) {
-						/*
-						 * MERGE
-						 */
-						String resolvedBy = entry.getString(Field.mergeSha);
-
-						// identify the merged patch, it is likely the last
-						Patchset mergedPatch = null;
-						for (Change c : revisions) {
-							if (c.patchset.tip.equals(resolvedBy)) {
-								mergedPatch = c.patchset;
-								break;
-							}
-						}
-
-						String commitLink;
-						if (mergedPatch == null) {
-							// shouldn't happen, but just-in-case
-							int len = app().settings().getInteger(Keys.web.shortCommitIdLength, 6);
-							commitLink = resolvedBy.substring(0, len);
-						} else {
-							// expected result
-							commitLink = mergedPatch.toString();
-						}
-
-						Fragment mergeFragment = new Fragment("entry", "mergeFragment", this);
-						mergeFragment.add(new LinkPanel("commitLink", null, commitLink,
-								CommitPage.class, WicketUtils.newObjectParameter(repositoryName, resolvedBy)));
-						mergeFragment.add(new Label("toBranch", MessageFormat.format(getString("gb.toBranch"),
-								"<b>" + ticket.mergeTo + "</b>")).setEscapeModelStrings(false));
-						addUserAttributions(mergeFragment, entry, 0);
-						addDateAttributions(mergeFragment, entry);
-
-						item.add(mergeFragment);
-					} else if (entry.isStatusChange()) {
-						/*
-						 *  STATUS CHANGE
-						 */
-						Fragment frag = new Fragment("entry", "statusFragment", this);
-						Label status = new Label("statusChange", entry.getStatus().toString());
-						String css = TicketsUI.getLozengeClass(entry.getStatus(), false);
-						WicketUtils.setCssClass(status, css);
-						frag.add(status);
-						addUserAttributions(frag, entry, avatarWidth);
-						addDateAttributions(frag, entry);
-						item.add(frag);
-					} else {
-						/*
-						 * COMMENT
-						 */
-						String bugtraq = bugtraqProcessor().processText(getRepository(), repositoryName, entry.comment.text);
-						String comment = MarkdownUtils.transformGFM(app().settings(), bugtraq, repositoryName);
-						String safeComment = app().xssFilter().relaxed(comment);
-						Fragment frag = new Fragment("entry", "commentFragment", this);
-						Label commentIcon = new Label("commentIcon");
-						if (entry.comment.src == CommentSource.Email) {
-							WicketUtils.setCssClass(commentIcon, "iconic-mail");
-						} else {
-							WicketUtils.setCssClass(commentIcon, "iconic-comment-alt2-stroke");
-						}
-						frag.add(commentIcon);
-						frag.add(new Label("comment", safeComment).setEscapeModelStrings(false));
-						addUserAttributions(frag, entry, avatarWidth);
-						addDateAttributions(frag, entry);
-						item.add(frag);
-					}
-				}
-			};
-			discussionFragment.add(discussionView);
-			add(discussionFragment);
-		}
-
-		/*
-		 * ADD COMMENT PANEL
-		 */
-		if (UserModel.ANONYMOUS.equals(user)
-				|| !repository.isBare
-				|| repository.isFrozen
-				|| repository.isMirror) {
-
-			// prohibit comments for anonymous users, local working copy repos,
-			// frozen repos, and mirrors
-			add(new Label("newComment").setVisible(false));
-		} else {
-			// permit user to comment
-			Fragment newComment = new Fragment("newComment", "newCommentFragment", this);
-			AvatarImage img = new AvatarImage("newCommentAvatar", user.username, user.emailAddress,
-					"gravatar-round", avatarWidth, true);
-			newComment.add(img);
-			CommentPanel commentPanel = new CommentPanel("commentPanel", user, ticket, null, TicketsPage.class);
-			commentPanel.setRepository(repositoryName);
-			newComment.add(commentPanel);
-			add(newComment);
-		}
-
-
-		/*
-		 *  PATCHSET TAB
-		 */
-		if (currentPatchset == null) {
-			// no patchset available
-			RepositoryUrl repoUrl = getRepositoryUrl(user, repository);
-			boolean canPropose = repoUrl != null && repoUrl.hasPermission() && repoUrl.permission.atLeast(AccessPermission.CLONE) && !UserModel.ANONYMOUS.equals(user);
-			if (ticket.isOpen() && app().tickets().isAcceptingNewPatchsets(repository) && canPropose) {
-				// ticket & repo will accept a proposal patchset
-				// show the instructions for proposing a patchset
-				Fragment changeIdFrag = new Fragment("patchset", "proposeFragment", this);
-				changeIdFrag.add(new Label("proposeInstructions", MarkdownUtils.transformMarkdown(getString("gb.proposeInstructions"))).setEscapeModelStrings(false));
-				changeIdFrag.add(new Label("ptWorkflow", MessageFormat.format(getString("gb.proposeWith"), "Barnum")));
-				changeIdFrag.add(new Label("ptWorkflowSteps", getProposeWorkflow("propose_pt.md", repoUrl.url, ticket.number)).setEscapeModelStrings(false));
-				changeIdFrag.add(new Label("gitWorkflow", MessageFormat.format(getString("gb.proposeWith"), "Git")));
-				changeIdFrag.add(new Label("gitWorkflowSteps", getProposeWorkflow("propose_git.md", repoUrl.url, ticket.number)).setEscapeModelStrings(false));
-				add(changeIdFrag);
-			} else {
-				// explain why you can't propose a patchset
-				Fragment fragment = new Fragment("patchset", "canNotProposeFragment", this);
-				String reason = "";
-				if (ticket.isClosed()) {
-					reason = getString("gb.ticketIsClosed");
-				} else if (repository.isMirror) {
-					reason = getString("gb.repositoryIsMirror");
-				} else if (repository.isFrozen) {
-					reason = getString("gb.repositoryIsFrozen");
-				} else if (!repository.acceptNewPatchsets) {
-					reason = getString("gb.repositoryDoesNotAcceptPatchsets");
-				} else if (!canPropose) {
-					if (UserModel.ANONYMOUS.equals(user)) {
-						reason = getString("gb.anonymousCanNotPropose");
-					} else {
-						reason = getString("gb.youDoNotHaveClonePermission");
-					}
-				} else {
-					reason = getString("gb.serverDoesNotAcceptPatchsets");
-				}
-				fragment.add(new Label("reason", reason));
-				add(fragment);
-			}
-		} else {
-			// show current patchset
-			Fragment patchsetFrag = new Fragment("patchset", "patchsetFragment", this);
-			patchsetFrag.add(new Label("commitsInPatchset", MessageFormat.format(getString("gb.commitsInPatchsetN"), currentPatchset.number)));
-
-			patchsetFrag.add(createMergePanel(user, repository));
-
-			if (ticket.isOpen()) {
-				// current revision
-				MarkupContainer panel = createPatchsetPanel("panel", repository, user);
-				patchsetFrag.add(panel);
-				addUserAttributions(patchsetFrag, currentRevision, avatarWidth);
-				addUserAttributions(panel, currentRevision, 0);
-				addDateAttributions(panel, currentRevision);
-			} else {
-				// current revision
-				patchsetFrag.add(new Label("panel").setVisible(false));
-			}
-
-			// commits
-			List<RevCommit> commits = JGitUtils.getRevLog(getRepository(), currentPatchset.base, currentPatchset.tip);
-			ListDataProvider<RevCommit> commitsDp = new ListDataProvider<RevCommit>(commits);
-			DataView<RevCommit> commitsView = new DataView<RevCommit>("commit", commitsDp) {
-				private static final long serialVersionUID = 1L;
-
-				@Override
-				public void populateItem(final Item<RevCommit> item) {
-					RevCommit commit = item.getModelObject();
-					PersonIdent author = commit.getAuthorIdent();
-					item.add(new AvatarImage("authorAvatar", author.getName(), author.getEmailAddress(), null, 16, false));
-					item.add(new Label("author", commit.getAuthorIdent().getName()));
-					item.add(new LinkPanel("commitId", null, getShortObjectId(commit.getName()),
-							CommitPage.class, WicketUtils.newObjectParameter(repositoryName, commit.getName()), true));
-					item.add(new LinkPanel("diff", "link", getString("gb.diff"), CommitDiffPage.class,
-							WicketUtils.newObjectParameter(repositoryName, commit.getName()), true));
-					item.add(new Label("title", StringUtils.trimString(commit.getShortMessage(), Constants.LEN_SHORTLOG_REFS)));
-					item.add(WicketUtils.createDateLabel("commitDate", JGitUtils.getAuthorDate(commit), GitBlitWebSession
-							.get().getTimezone(), getTimeUtils(), false));
-					item.add(new DiffStatPanel("commitDiffStat", 0, 0, true));
-				}
-			};
-			patchsetFrag.add(commitsView);
-			add(patchsetFrag);
-		}
-
-
-		/*
-		 * ACTIVITY TAB
-		 */
-		Fragment revisionHistory = new Fragment("activity", "activityFragment", this);
-		List<Change> events = new ArrayList<Change>(ticket.changes);
-		Collections.sort(events);
-		Collections.reverse(events);
-		ListDataProvider<Change> eventsDp = new ListDataProvider<Change>(events);
-		DataView<Change> eventsView = new DataView<Change>("event", eventsDp) {
-			private static final long serialVersionUID = 1L;
-
-			@Override
-			public void populateItem(final Item<Change> item) {
-				Change event = item.getModelObject();
-
-				addUserAttributions(item, event, 16);
-
-				if (event.hasPatchset()) {
-					// patchset
-					Patchset patchset = event.patchset;
-					String what;
-					if (event.isStatusChange() && (Status.New == event.getStatus())) {
-						what = getString("gb.proposedThisChange");
-					} else if (patchset.rev == 1) {
-						what = MessageFormat.format(getString("gb.uploadedPatchsetN"), patchset.number);
-					} else {
-						if (patchset.added == 1) {
-							what = getString("gb.addedOneCommit");
-						} else {
-							what = MessageFormat.format(getString("gb.addedNCommits"), patchset.added);
-						}
-					}
-					item.add(new Label("what", what));
-
-					LinkPanel psr = new LinkPanel("patchsetRevision", null, patchset.number + "-" + patchset.rev,
-							ComparePage.class, WicketUtils.newRangeParameter(repositoryName, patchset.parent == null ? patchset.base : patchset.parent, patchset.tip), true);
-					WicketUtils.setHtmlTooltip(psr, patchset.toString());
-					WicketUtils.setCssClass(psr, "aui-lozenge aui-lozenge-subtle");
-					item.add(psr);
-					String typeCss = getPatchsetTypeCss(patchset.type);
-					Label typeLabel = new Label("patchsetType", patchset.type.toString());
-					if (typeCss == null) {
-						typeLabel.setVisible(false);
-					} else {
-						WicketUtils.setCssClass(typeLabel, typeCss);
-					}
-					item.add(typeLabel);
-
-					Link<Void> deleteLink = createDeletePatchsetLink(repository, patchset);
-					
-					if (user.canDeleteRef(repository)) {
-						item.add(deleteLink.setVisible(patchset.canDelete));
-					} else {
-						item.add(deleteLink.setVisible(false));
-					}
-
-					// show commit diffstat
-					item.add(new DiffStatPanel("patchsetDiffStat", patchset.insertions, patchset.deletions, patchset.rev > 1));
-				} else if (event.hasComment()) {
-					// comment
-					item.add(new Label("what", getString("gb.commented")));
-					item.add(new Label("patchsetRevision").setVisible(false));
-					item.add(new Label("patchsetType").setVisible(false));
-					item.add(new Label("deleteRevision").setVisible(false));
-					item.add(new Label("patchsetDiffStat").setVisible(false));
-				} else if (event.hasReference()) {
-					// reference
-					switch (event.reference.getSourceType()) {
-						case Commit: {
-							final int shaLen = app().settings().getInteger(Keys.web.shortCommitIdLength, 6);
-							
-							item.add(new Label("what", getString("gb.referencedByCommit")));
-							LinkPanel psr = new LinkPanel("patchsetRevision", null, event.reference.toString().substring(0, shaLen),
-									CommitPage.class, WicketUtils.newObjectParameter(repositoryName, event.reference.toString()), true);
-							WicketUtils.setHtmlTooltip(psr, event.reference.toString());
-							WicketUtils.setCssClass(psr, "ticketReference-commit shortsha1");
-							item.add(psr);
-							
-						} break;
-						
-						case Ticket: {
-							final String text = MessageFormat.format("ticket/{0}", event.reference.ticketId);
-
-							item.add(new Label("what", getString("gb.referencedByTicket")));
-							//NOTE: Ideally reference the exact comment using reference.toString,
-							//		however anchor hash is used and is escaped resulting in broken link
-							LinkPanel psr = new LinkPanel("patchsetRevision", null,  text,
-									TicketsPage.class, WicketUtils.newObjectParameter(repositoryName, event.reference.ticketId.toString()), true);
-							WicketUtils.setCssClass(psr, "ticketReference-comment");
-							item.add(psr);
-						} break;
-					
-						default: {
-							item.add(new Label("what").setVisible(false));
-							item.add(new Label("patchsetRevision").setVisible(false));
-						}
-					}
-					
-					item.add(new Label("patchsetType").setVisible(false));
-					item.add(new Label("deleteRevision").setVisible(false));
-					item.add(new Label("patchsetDiffStat").setVisible(false));
-				} else if (event.hasReview()) {
-					// review
-					String score;
-					switch (event.review.score) {
-					case approved:
-						score = "<span style='color:darkGreen'>" + getScoreDescription(event.review.score) + "</span>";
-						break;
-					case vetoed:
-						score = "<span style='color:darkRed'>" + getScoreDescription(event.review.score) + "</span>";
-						break;
-					default:
-						score = getScoreDescription(event.review.score);
-					}
-					item.add(new Label("what", MessageFormat.format(getString("gb.reviewedPatchsetRev"),
-							event.review.patchset, event.review.rev, score))
-							.setEscapeModelStrings(false));
-					item.add(new Label("patchsetRevision").setVisible(false));
-					item.add(new Label("patchsetType").setVisible(false));
-					item.add(new Label("deleteRevision").setVisible(false));
-					item.add(new Label("patchsetDiffStat").setVisible(false));
-				} else {
-					// field change
-					item.add(new Label("patchsetRevision").setVisible(false));
-					item.add(new Label("patchsetType").setVisible(false));
-					item.add(new Label("deleteRevision").setVisible(false));
-					item.add(new Label("patchsetDiffStat").setVisible(false));
-
-					String what = "";
-					if (event.isStatusChange()) {
-					switch (event.getStatus()) {
-					case New:
-						if (ticket.isProposal()) {
-							what = getString("gb.proposedThisChange");
-						} else {
-							what = getString("gb.createdThisTicket");
-						}
-						break;
-					default:
-						break;
-					}
-					}
-					item.add(new Label("what", what).setVisible(what.length() > 0));
-				}
-
-				addDateAttributions(item, event);
-
-				if (event.hasFieldChanges()) {
-					StringBuilder sb = new StringBuilder();
-					sb.append("<table class=\"summary\"><tbody>");
-					for (Map.Entry<Field, String> entry : event.fields.entrySet()) {
-						String value;
-						switch (entry.getKey()) {
-							case body:
-								String body = entry.getValue();
-								if (event.isStatusChange() && Status.New == event.getStatus() && StringUtils.isEmpty(body)) {
-									// ignore initial empty description
-									continue;
-								}
-								// trim body changes
-								if (StringUtils.isEmpty(body)) {
-									value = "<i>" + ESC_NIL + "</i>";
-								} else {
-									value = StringUtils.trimString(body, Constants.LEN_SHORTLOG_REFS);
-								}
-								break;
-							case status:
-								// special handling for status
-								Status status = event.getStatus();
-								String css = TicketsUI.getLozengeClass(status, true);
-								value = String.format("<span class=\"%1$s\">%2$s</span>", css, status.toString());
-								break;
-							default:
-								value = StringUtils.isEmpty(entry.getValue()) ? ("<i>" + ESC_NIL + "</i>") : StringUtils.escapeForHtml(entry.getValue(), false);
-								break;
-						}
-						sb.append("<tr><th style=\"width:70px;\">");
-						try {
-							sb.append(getString("gb." + entry.getKey().name()));
-						} catch (Exception e) {
-							sb.append(entry.getKey().name());
-						}
-						sb.append("</th><td>");
-						sb.append(value);
-						sb.append("</td></tr>");
-					}
-					sb.append("</tbody></table>");
-					String safeHtml = app().xssFilter().relaxed(sb.toString());
-					item.add(new Label("fields", safeHtml).setEscapeModelStrings(false));
-				} else {
-					item.add(new Label("fields").setVisible(false));
-				}
-			}
-		};
-		revisionHistory.add(eventsView);
-		add(revisionHistory);
+	private Date getCreatedDate(TimeZone timezone, Date ticketDate) {
+		final Calendar cal = Calendar.getInstance(timezone);
+		cal.setTime(ticketDate);
+		cal.set(Calendar.HOUR_OF_DAY, 0);
+		cal.set(Calendar.MINUTE, 0);
+		cal.set(Calendar.SECOND, 0);
+		cal.set(Calendar.MILLISECOND, 0);
+		return cal.getTime();
 	}
 
 	protected void addUserAttributions(MarkupContainer container, Change entry, int avatarSize) {
